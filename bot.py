@@ -1,12 +1,14 @@
 import asyncio
 import logging
 import os
-from aiogram import Bot, Dispatcher, html
+import tempfile
+from aiogram import Bot, Dispatcher, html, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 # Carrega variáveis de ambiente
 load_dotenv()
@@ -14,92 +16,170 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Verifica se o TOKEN existe
-if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN não encontrado nas variáveis de ambiente.")
+if not TOKEN or not OPENAI_API_KEY:
+    raise ValueError("Verifique as chaves TELEGRAM_BOT_TOKEN e OPENAI_API_KEY no .env")
 
 # Instancia o bot e o dispatcher
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Dicionário temporário para gerenciar tarefas de timers (5 minutos)
-# Formato: {chat_id: asyncio.Task}
+# Cliente Async da OpenAI
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# Dicionários de Memória
 inactivity_timers = {}
+conversations = {}
+
+# Carrega o System Prompt
+with open("system_prompt.md", "r", encoding="utf-8") as f:
+    SYSTEM_PROMPT = f.read()
+
+def init_history(chat_id: int):
+    # Inicializa ou zera o hitórico usando o System Prompt
+    conversations[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+def append_to_history(chat_id: int, role: str, content: str):
+    if chat_id not in conversations:
+        init_history(chat_id)
+    conversations[chat_id].append({"role": role, "content": content})
+    # Limita o histórico das últimas 20 interações p/ economizar tokens e memória
+    if len(conversations[chat_id]) > 21:
+        conversations[chat_id] = [conversations[chat_id][0]] + conversations[chat_id][-20:]
 
 async def inactivity_trigger(chat_id: int):
     """
-    Função chamada após 5 minutos de inatividade para gerar o Deep Feedback Report.
+    Acionado após 5 minutos. Analisa as últimas mensagens e manda um "Deep Feedback Report".
     """
     try:
-        # Aguarda 5 minutos (300 segundos)
-        await asyncio.sleep(300)
+        await asyncio.sleep(300) # Aguarda 5 Minutos
         
-        # Aqui chamaremos a API da OpenAI para gerar o Deep Feedback Report!
-        report_message = (
-            "⏳ <b>5 Minutos de Inatividade!</b>\n\n"
-            "Aqui está o seu <b>[Deep Feedback Report]</b> das nossas últimas interações:\n\n"
-            "<i>(Esta é uma mensagem temporária de placeholder estrutural, a integração completa com a OpenAI entrará aqui)</i>\n\n"
-            "O que acha de retomarmos a aula de onde paramos?"
+        # Evita mandar feedback se não houveram trocas além do system prompt
+        if chat_id not in conversations or len(conversations[chat_id]) <= 2:
+            return  
+            
+        logging.info(f"Gerando Deep Feedback Report para {chat_id}")
+        await bot.send_chat_action(chat_id=chat_id, action="typing")
+        
+        analysis_prompt = (
+            "The 5-minute inactivity timer has been triggered. "
+            "Based on our recent conversation history, please generate a [Deep Feedback Report]. "
+            "Analyze my sentence structures, suggest advanced synonyms for words I used, and point out any bad habits. "
+            "End your message with a compelling/engaging question to resume the class."
         )
-        await bot.send_message(chat_id=chat_id, text=report_message)
+        
+        # Cria uma cópia temporária e adiciona o prompt de timeout
+        messages_to_send = conversations[chat_id].copy()
+        messages_to_send.append({"role": "user", "content": analysis_prompt})
+        
+        response = await client.chat.completions.create(
+            model="gpt-4o",  # Troque para gpt-3.5-turbo se quiser reduzir o custo
+            messages=messages_to_send,
+            temperature=0.7
+        )
+        
+        report_text = response.choices[0].message.content
+        append_to_history(chat_id, "assistant", report_text)
+        await bot.send_message(chat_id=chat_id, text=report_text)
+        
     except asyncio.CancelledError:
-        # A tarefa foi cancelada porque o usuário enviou uma mensagem antes dos 5 min
+        # Usuário enviou nova mensagem e cancelou o alarme antes de ser disparado
         pass
+    except Exception as e:
+        logging.error(f"Erro no timer de inatividade para {chat_id}: {e}")
 
 def reset_inactivity_timer(chat_id: int):
-    """
-    Cancela o timer existente de um usuário (se houver) e inicia um novo.
-    """
-    if chat_id in inactivity_timers:
+    if chat_id in inactivity_timers and not inactivity_timers[chat_id].done():
         inactivity_timers[chat_id].cancel()
-    
-    # Cria uma nova task para o chat_id atual
     inactivity_timers[chat_id] = asyncio.create_task(inactivity_trigger(chat_id))
 
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
-    """
-    Responde ao comando /start.
-    """
-    with open("system_prompt.md", "r", encoding="utf-8") as f:
-        # Só para propósitos de logging
-        sys_prompt = f.read()
-
+    init_history(message.chat.id)
+    
     welcome_text = (
-        f"Hello, {html.bold(message.from_user.full_name)}! 🇬🇧\n"
-        "I'm your AI English Tutor. Podemos praticar sobre temas do dia a dia, "
-        "ou caso queira apenas saber o significado de uma palavra, pode mandá-la isolada!"
+        f"Hi, {html.bold(message.from_user.full_name)}! 🇬🇧\n\n"
+        "I'm your AI English Tutor. Let's chat!\n"
+        "Podemos praticar sobre qualquer tema que desejar. Além disso, se precisar do modo dicionário, basta me mandar qualquer palavra *isolada* e eu vou te responder com a pronúncia, função gramatical e exemplos!"
     )
     await message.answer(welcome_text)
-    
-    # Inicia o monitoramento de inatividade do usuário
     reset_inactivity_timer(message.chat.id)
 
-@dp.message()
+@dp.message(F.voice | F.text)
 async def main_chat_handler(message: Message) -> None:
-    """
-    Handler principal para receber texto ou áudio.
-    """
-    # 1. Resetar o timer de 5 minutos, pois recebemos uma nova mensagem!
-    reset_inactivity_timer(message.chat.id)
-
-    # 2. Esqueleto: verificar se é áudio (STT) ou texto.
+    chat_id = message.chat.id
+    reset_inactivity_timer(chat_id)
+    
+    await bot.send_chat_action(chat_id=chat_id, action="typing")
     user_text = ""
+
+    # Captura caso áudio
     if message.voice:
-        # Aqui será baixado o .ogg e feita chamada STT OpenAI Whisper
-        user_text = "[Transcrição de Áudio]"
-    else:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_audio:
+                file_id = message.voice.file_id
+                file = await bot.get_file(file_id)
+                await bot.download_file(file.file_path, tmp_audio.name)
+            
+            with open(tmp_audio.name, "rb") as audio_file:
+                transcription = await client.audio.transcriptions.create(
+                    model="whisper-1", 
+                    file=audio_file,
+                    language="en"
+                )
+            user_text = transcription.text
+            os.remove(tmp_audio.name)
+            
+            # Avisa o que escutou pra dar confirmação visual
+            await message.reply(f"<i>🎙 Transcribed:</i> {html.quote(user_text)}")
+            
+        except Exception as e:
+            logging.error(f"Erro ao processar áudio: {e}")
+            await message.answer("Desculpe, não consegui entender bem esse áudio. Pode repetir ou digitar?")
+            return
+    elif message.text:
         user_text = message.text
 
-    # 3. Lógica para bater na API da OpenAI e retornar a resposta
-    response_text = (
-        f"You said: <i>{html.quote(user_text)}</i>\n\n"
-        "<i>(A integração com o prompt de `[Quick Correction]` e ChatGPT entra aqui.)</i>"
-    )
-    
-    # 4. Responder ao usuário
-    await message.answer(response_text)
+    if not user_text.strip():
+        return
 
+    # Registra no histórico e bate no gpt-4o
+    append_to_history(chat_id, "user", user_text)
+    
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=conversations[chat_id],
+            temperature=0.7
+        )
+        assistant_reply = response.choices[0].message.content
+        append_to_history(chat_id, "assistant", assistant_reply)
+        
+        await message.answer(assistant_reply)
+        
+        # Modo Tradutor: Se tem poucas palavras (1 a 2) dispara áudio de volta
+        words_count = len(user_text.strip().split())
+        if words_count <= 2:
+            await bot.send_chat_action(chat_id=chat_id, action="record_voice")
+            
+            # Gera audio opus pro telegram pegar como 'Voice' message nativa
+            audio_response = await client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=assistant_reply,
+                response_format="opus"
+            )
+            
+            # Salvar temporariamente
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_tts:
+                audio_response.stream_to_file(tmp_tts.name)
+            
+            voice_file = FSInputFile(tmp_tts.name)
+            await bot.send_voice(chat_id=chat_id, voice=voice_file)
+            os.remove(tmp_tts.name)
+            
+    except Exception as e:
+        logging.error(f"Erro ao conectar com OpenAI: {e}")
+        await message.answer("Oops! Tive um problema para me conectar com meu cérebro criativo (API do ChatGPT).")
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
