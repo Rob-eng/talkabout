@@ -156,26 +156,24 @@ async def main_chat_handler(message: Message) -> None:
         
         await message.answer(assistant_reply)
         
-        # Modo Tradutor: Se tem poucas palavras (1 a 2) dispara áudio de volta
-        words_count = len(user_text.strip().split())
-        if words_count <= 2:
-            await bot.send_chat_action(chat_id=chat_id, action="record_voice")
-            
-            # Gera audio opus pro telegram pegar como 'Voice' message nativa
-            audio_response = await client.audio.speech.create(
-                model="tts-1",
-                voice="alloy",
-                input=assistant_reply,
-                response_format="opus"
-            )
-            
-            # Salvar temporariamente
-            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_tts:
-                audio_response.stream_to_file(tmp_tts.name)
-            
-            voice_file = FSInputFile(tmp_tts.name)
-            await bot.send_voice(chat_id=chat_id, voice=voice_file)
-            os.remove(tmp_tts.name)
+        # Sempre responde com áudio também!
+        await bot.send_chat_action(chat_id=chat_id, action="record_voice")
+        
+        # Gera audio opus pro telegram pegar como 'Voice' message nativa
+        audio_response = await client.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=assistant_reply[:4000], # Limite da openai api
+            response_format="opus"
+        )
+        
+        # Salvar temporariamente
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_tts:
+            audio_response.stream_to_file(tmp_tts.name)
+        
+        voice_file = FSInputFile(tmp_tts.name)
+        await bot.send_voice(chat_id=chat_id, voice=voice_file)
+        os.remove(tmp_tts.name)
             
     except Exception as e:
         logging.error(f"Erro ao conectar com OpenAI: {e}")
