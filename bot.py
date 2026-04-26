@@ -9,12 +9,15 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import database
 
 # Carrega variáveis de ambiente
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
 if not TOKEN or not OPENAI_API_KEY:
     raise ValueError("Verifique as chaves TELEGRAM_BOT_TOKEN e OPENAI_API_KEY no .env")
@@ -26,35 +29,24 @@ dp = Dispatcher()
 # Cliente Async da OpenAI
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Dicionários de Memória
+# Dicionário de inatividade na memória
 inactivity_timers = {}
-conversations = {}
 
-# Carrega o System Prompt
+# Variável global para o pool do banco
+db_pool = None
+
 with open("system_prompt.md", "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
 
-def init_history(chat_id: int):
-    # Inicializa ou zera o hitórico usando o System Prompt
-    conversations[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-def append_to_history(chat_id: int, role: str, content: str):
-    if chat_id not in conversations:
-        init_history(chat_id)
-    conversations[chat_id].append({"role": role, "content": content})
-    # Limita o histórico das últimas 20 interações p/ economizar tokens e memória
-    if len(conversations[chat_id]) > 21:
-        conversations[chat_id] = [conversations[chat_id][0]] + conversations[chat_id][-20:]
-
 async def inactivity_trigger(chat_id: int):
-    """
-    Acionado após 5 minutos. Analisa as últimas mensagens e manda um "Deep Feedback Report".
-    """
     try:
         await asyncio.sleep(300) # Aguarda 5 Minutos
         
-        # Evita mandar feedback se não houveram trocas além do system prompt
-        if chat_id not in conversations or len(conversations[chat_id]) <= 2:
+        # Puxamos apenas o ultimos turnos do BD 
+        history = await database.get_conversation_history(db_pool, chat_id, SYSTEM_PROMPT, limit=5)
+        
+        # O bd ja insere o "system" no id 0. Se history tiver so 1, não houve coversa.
+        if len(history) <= 1:
             return  
             
         logging.info(f"Gerando Deep Feedback Report para {chat_id}")
@@ -67,22 +59,22 @@ async def inactivity_trigger(chat_id: int):
             "End your message with a compelling/engaging question to resume the class."
         )
         
-        # Cria uma cópia temporária e adiciona o prompt de timeout
-        messages_to_send = conversations[chat_id].copy()
+        messages_to_send = history.copy()
         messages_to_send.append({"role": "user", "content": analysis_prompt})
         
         response = await client.chat.completions.create(
-            model="gpt-4o",  # Troque para gpt-3.5-turbo se quiser reduzir o custo
+            model="gpt-4o",
             messages=messages_to_send,
             temperature=0.7
         )
         
         report_text = response.choices[0].message.content
-        append_to_history(chat_id, "assistant", report_text)
+        
+        # Grava a mensagem do analista no banco
+        await database.append_message(db_pool, chat_id, "assistant", report_text)
         await bot.send_message(chat_id=chat_id, text=report_text)
         
     except asyncio.CancelledError:
-        # Usuário enviou nova mensagem e cancelou o alarme antes de ser disparado
         pass
     except Exception as e:
         logging.error(f"Erro no timer de inatividade para {chat_id}: {e}")
@@ -92,27 +84,91 @@ def reset_inactivity_timer(chat_id: int):
         inactivity_timers[chat_id].cancel()
     inactivity_timers[chat_id] = asyncio.create_task(inactivity_trigger(chat_id))
 
+async def send_weekly_summaries(pool):
+    """
+    Função rodada nas Segundas-Feiras.
+    Coleta tudo que foi conversado por cada aluno e gera + manda um resumo pro ADMIN.
+    """
+    if not ADMIN_CHAT_ID:
+        logging.warning("ADMIN_CHAT_ID não definido. Impossível enviar relatórios semanais.")
+        return
+        
+    users_data = await database.get_week_messages_for_reports(pool)
+    
+    if not users_data:
+        try:
+            await bot.send_message(chat_id=ADMIN_CHAT_ID, text="📊 <b>Relatório Semanal:</b>\nNenhum aluno praticou inglês nesta última semana.")
+        except Exception:
+            pass
+        return
+        
+    await bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"📊 <b>Relatório Semanal Iniciado:</b>\nGerando análise para {len(users_data)} aluno(s)...")
+
+    for u_id, data in users_data.items():
+        # Vamos concatenar o histórico dele pra enviar ao GPT, limitando ao tamanho p/ ninguem falir em tokens
+        # Junta todas as mensagens pra mandar como 1 bloção, limitando aos últimos 50 turnos (+- 20.000 chars)
+        compiled_chat = "\n".join(data["messages"][-50:]) 
+        
+        prompt = (
+            f"Você é um gerente pedagógico. Analise o histórico recente de conversas do aluno '{data['name']}' "
+            "com nosso tutor de inglês e faça um resumo direto em Português sobre:\n"
+            "- O que ele aprendeu/praticou (ex: vocabulário focado em negócios, falsos cognatos, correções frequentes).\n"
+            "- O nível de engajamento do aluno.\n"
+            "Mantenha o resumo em um formato claro e com bullet points (Max 3 parágrafos).\n\n"
+            f"HISTÓRICO:\n{compiled_chat}"
+        )
+        
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o",  
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5
+            )
+            admin_report = f"👤 <b>Relatório do Aluno:</b> {html.quote(data['name'])}\n\n{response.choices[0].message.content}"
+            # Usa o ID do admin para enviar a DM
+            await bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_report)
+            
+        except Exception as e:
+            logging.error(f"Falha ao gerar relatório para {u_id}: {e}")
+
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
-    init_history(message.chat.id)
+    chat_id = message.chat.id
+    user_name = message.from_user.full_name
     
+    # Processa usuário no banco. Retorna True se for Novo!
+    is_new = await database.process_new_user(db_pool, chat_id, user_name)
+    
+    if is_new and ADMIN_CHAT_ID:
+        try:
+            # Avisa o Administrador
+            await bot.send_message(
+                chat_id=ADMIN_CHAT_ID, 
+                text=f"🚀 <b>Novo Cadastro de Aluno!</b>\nO usuário <b>{html.quote(user_name)}</b> acabou de iniciar a primeira aula."
+            )
+        except Exception as e:
+            logging.error(f"Erro ao avisar admin {ADMIN_CHAT_ID}: {e}")
+            
     welcome_text = (
-        f"Hi, {html.bold(message.from_user.full_name)}! 🇬🇧\n\n"
+        f"Hi, {html.bold(user_name)}! 🇬🇧\n\n"
         "I'm your AI English Tutor. Let's chat!\n"
         "Podemos praticar sobre qualquer tema que desejar. Além disso, se precisar do modo dicionário, basta me mandar qualquer palavra *isolada* e eu vou te responder com a pronúncia, função gramatical e exemplos!"
     )
     await message.answer(welcome_text)
-    reset_inactivity_timer(message.chat.id)
+    reset_inactivity_timer(chat_id)
 
 @dp.message(F.voice | F.text)
 async def main_chat_handler(message: Message) -> None:
     chat_id = message.chat.id
+    user_name = message.from_user.full_name
+    
+    # Previne que o bot atropele sem registrar novos se eles não deram start
+    await database.process_new_user(db_pool, chat_id, user_name)
     reset_inactivity_timer(chat_id)
     
     await bot.send_chat_action(chat_id=chat_id, action="typing")
     user_text = ""
 
-    # Captura caso áudio
     if message.voice:
         try:
             with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_audio:
@@ -129,9 +185,7 @@ async def main_chat_handler(message: Message) -> None:
             user_text = transcription.text
             os.remove(tmp_audio.name)
             
-            # Avisa o que escutou pra dar confirmação visual
             await message.reply(f"<i>🎙 Transcribed:</i> {html.quote(user_text)}")
-            
         except Exception as e:
             logging.error(f"Erro ao processar áudio: {e}")
             await message.answer("Desculpe, não consegui entender bem esse áudio. Pode repetir ou digitar?")
@@ -142,32 +196,35 @@ async def main_chat_handler(message: Message) -> None:
     if not user_text.strip():
         return
 
-    # Registra no histórico e bate no gpt-4o
-    append_to_history(chat_id, "user", user_text)
+    # Registra a mensagem do usuário no Banco de Dados
+    await database.append_message(db_pool, chat_id, "user", user_text)
     
     try:
+        # Recupera as ultimas 20 msgs do banco
+        history = await database.get_conversation_history(db_pool, chat_id, SYSTEM_PROMPT, limit=20)
+        
         response = await client.chat.completions.create(
             model="gpt-4o",
-            messages=conversations[chat_id],
+            messages=history,
             temperature=0.7
         )
         assistant_reply = response.choices[0].message.content
-        append_to_history(chat_id, "assistant", assistant_reply)
+        
+        # Salva a resposta da IA no banco
+        await database.append_message(db_pool, chat_id, "assistant", assistant_reply)
         
         await message.answer(assistant_reply)
         
         # Sempre responde com áudio também!
         await bot.send_chat_action(chat_id=chat_id, action="record_voice")
         
-        # Gera audio opus pro telegram pegar como 'Voice' message nativa
         audio_response = await client.audio.speech.create(
             model="tts-1",
             voice="alloy",
-            input=assistant_reply[:4000], # Limite da openai api
+            input=assistant_reply[:4000],
             response_format="opus"
         )
         
-        # Salvar temporariamente
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_tts:
             audio_response.stream_to_file(tmp_tts.name)
         
@@ -181,6 +238,21 @@ async def main_chat_handler(message: Message) -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    
+    global db_pool
+    # 1. Configura e conecta banco de dados PostgreSQL
+    db_pool = await database.get_pool()
+    await database.init_db(db_pool)
+    logging.info("Tabelas SQL verificadas!")
+    
+    # 2. Configura o Agendador para rodar os relatórios
+    # Aqui agendamos para as Segundas ("mon") às 08:00 AM no fuso do Brasil
+    scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
+    scheduler.add_job(send_weekly_summaries, "cron", day_of_week="mon", hour=8, minute=0, args=(db_pool,))
+    scheduler.start()
+    logging.info("Agendador de relatórios semanais acionado!")
+    
+    # 3. Inicia o Bot
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
